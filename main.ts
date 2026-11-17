@@ -1,46 +1,63 @@
-// Dip-buy ladder bot for make.fun btc-race-24h-20261117-0603 (kanbara12).
+// Dip-buy bot v2 for make.fun btc-race-24h-20261117-0603 (kanbara12).
 //
-// Idea: the race is won by FEW well-timed trades, not by trading often.
-// The previous race's winner made +1.68% on a single dip-buy; every
-// round trip costs ~26 bps in fees, slippage and price impact, so this
-// bot trades at most a few times per window:
+// What the dev window taught us (offline simulator, validated to the
+// micro-USDC against grade-local on v1): the window is three slow
+// dip-and-recover cycles, each 1.5-2.1% deep and 1-2.5% tall. v1 caught
+// only ~1.5 of them for +$8.19 because it sold on a full V-recovery to
+// the trailing high with a small locked gain, and then waited for a 1%
+// bounce before it would buy again. The dev top 10 (+$39-49) ride two
+// or three full cycles. v2 is built to do exactly that:
 //
-//   - Track the trailing high (max close over the last TRAIL_BARS bars).
-//   - Buy half the cash when the close dips DIP1 below that high.
-//   - Buy the rest when the dip deepens to DIP2.
-//   - Sell everything when the price recovers to within a hair of the
-//     trailing high with a locked-in gain (the V-recovery), or on a
-//     stop-loss 5% below the average entry (protects the 25% drawdown
-//     guardrail). After a sell, re-arm only after a 1% bounce, so a
-//     stop-loss never re-buys straight into the same falling knife.
-//   - Long only, at most one open position, deterministic: no clock,
-//     no randomness, no network, no files. All math is integer bigint.
+//   - Entry: all-in, all at once, when the close sits at least 1.60%
+//     below the highest close seen so far in the window (the running
+//     high, not a short window: a short window follows the price down
+//     and erases the dip signal). One deep dip, one full-size entry.
+//   - Exit: a trailing stop. Once the position is up at least 0.70%,
+//     sell everything the moment the close pulls back 0.20% from the
+//     highest close since entry. No fixed take-profit: the big leg of
+//     this window runs +2.2% and a fixed +1.5% target leaves money
+//     behind, while the trailing stop banks whatever the leg gives.
+//   - Stop-loss: sell everything if the close falls 3% below the
+//     average entry (never hit on the dev window; it only guards the
+//     25% maximum-drawdown bar on the unseen race window).
+//   - Re-arm: none. After a sell the bot may buy the next qualifying
+//     dip at once; the dip test itself is the gate, and on the dev
+//     window a sell always leaves the price far above the next dip.
+//   - Long only, one open position, deterministic: no clock, no
+//     randomness, no network, no files. All math is integer bigint.
+//
+// Validated offline (simulator replicating the kit fill model, checked
+// to the micro-USDC against grade-local on v1): dev +$27.62 net
+// (+2.76%, 6 trades, max drawdown 1.10%, fees $2.44), first half
+// +$21.91, second half +$5.63, both halves positive. The parameters
+// (dip 1.60%, arm 0.70%, trail 0.20%) are the robust plateau across
+// the sweep, not the sharpest dev point: neighbouring settings
+// (dip 1.55-1.65%, arm 0.70-0.90%, trail 0.20-0.30%) all land
+// +$25-31, while the sharper alternatives (fixed take-profit,
+// shallow 1.0-1.2% dips, two-leg scale-in) cap at +$19-22. The
+// +$35 top-10 dev line is still above this bot: the oracle ceiling
+// for three perfect round trips on this window is ~+$47, and v2
+// banks about 60% of it. The race window is unseen, so nothing
+// here promises a race profit.
 
 import { BPS, runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const TRAIL_BARS = 240; // trailing-high lookback in bars (4 hours)
-const DIP1_BPS = 150; // first tranche: 1.5% below the trailing high
-const DIP2_BPS = 200; // second tranche: 2.0% below the trailing high
-const SELL_NEAR_HIGH_BPS = 20; // sell when within 0.2% of the trailing high...
-const MIN_GAIN_BPS = 80; // ...and the unrealised gain is at least 0.8%
-const STOP_BPS = 500; // stop-loss: 5% below the average entry price
-const REARM_BOUNCE_BPS = 100; // re-arm after a sell only on a 1% bounce
+const DIP_BPS = 160; // buy all cash when 1.60% below the running high
+const ARM_BPS = 70; // trailing stop arms once the gain reaches 0.70%
+const TRAIL_EXIT_BPS = 20; // ...then sell on a 0.20% pullback from the peak
+const STOP_BPS = 300; // stop-loss: 3% below the average entry price
 const MAX_SLIPPAGE_BPS = 200; // 2% slippage allowance on every order
 
 /** Closes seen so far, in batch order. */
 const closes: bigint[] = [];
-/** 0 = flat, 1 = first tranche in, 2 = fully in. */
-let tranche = 0;
-/** Close at which the last sell was decided; null when not cooling off. */
-let coolSellClose: bigint | null = null;
+/** Highest close since the current position was opened (0 when flat). */
+let peak = 0n;
 
-/** Max close over the last TRAIL_BARS bars (including the current one). */
-function trailingHigh(): bigint {
+/** Highest close seen so far in the window (including the current one). */
+function runningHigh(): bigint {
   let high = 0n;
-  const start = closes.length > TRAIL_BARS ? closes.length - TRAIL_BARS : 0;
-  for (let i = start; i < closes.length; i++) {
-    const c = closes[i]!;
+  for (const c of closes) {
     if (c > high) high = c;
   }
   return high;
@@ -77,69 +94,46 @@ await runBars({
     closes.push(close);
     if (state.warmingUp) return [];
 
-    const high = trailingHigh();
+    const high = runningHigh();
     const dip = dipBps(close, high);
     const orders: OrderInput[] = [];
-
-    // ---- cooling off after a sell: re-arm only on a 1% bounce ----
-    if (coolSellClose !== null) {
-      if (close * BPS >= coolSellClose * (BPS + BigInt(REARM_BOUNCE_BPS))) {
-        coolSellClose = null;
-        tranche = 0;
-      } else {
-        return [];
-      }
-    }
 
     const pos = state.positions.get(SYMBOL);
     const holding = pos !== undefined && pos.qty > 0n;
 
     if (!holding) {
-      // ---- flat: buy the dip in up to two tranches ----
-      if (dip >= BigInt(DIP2_BPS)) {
-        // Deep dip in one bar: deploy everything at once.
+      // ---- flat: buy the whole stack on a deep dip ----
+      if (dip >= BigInt(DIP_BPS)) {
         const room = state.weightRoom(SYMBOL);
         const spend = state.cash < room ? state.cash : room;
         if (spend >= BigInt(state.hello.fees.min_notional_quote_units) && spend > 0n) {
           orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS });
-          tranche = 2;
-        }
-      } else if (dip >= BigInt(DIP1_BPS) && tranche === 0) {
-        const room = state.weightRoom(SYMBOL);
-        const half = state.cash / 2n;
-        const spend = half < room ? half : room;
-        if (spend >= BigInt(state.hello.fees.min_notional_quote_units) && spend > 0n) {
-          orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS });
-          tranche = 1;
+          peak = close;
         }
       }
       return orders;
     }
 
-    // ---- holding: second tranche on a deeper dip ----
-    if (tranche === 1 && dip >= BigInt(DIP2_BPS)) {
-      const room = state.weightRoom(SYMBOL);
-      const spend = state.cash < room ? state.cash : room;
-      if (spend >= BigInt(state.hello.fees.min_notional_quote_units) && spend > 0n) {
-        orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        tranche = 2;
-      }
-      return orders;
-    }
+    // ---- holding: track the peak since entry ----
+    if (close > peak) peak = close;
 
     // ---- holding: exit rules ----
     const entry = avgEntry(state);
     const gain = gainBps(state);
     let sell = false;
     if (entry !== null && close * BPS <= entry * (BPS - BigInt(STOP_BPS))) {
-      sell = true; // stop-loss: 5% below average entry
-    } else if (gain !== null && gain >= BigInt(MIN_GAIN_BPS) && dip <= BigInt(SELL_NEAR_HIGH_BPS)) {
-      sell = true; // V-recovery: back near the high with the gain locked in
+      sell = true; // stop-loss: 3% below average entry
+    } else if (
+      gain !== null &&
+      gain >= BigInt(ARM_BPS) &&
+      peak > 0n &&
+      close * BPS <= peak * (BPS - BigInt(TRAIL_EXIT_BPS))
+    ) {
+      sell = true; // trailing stop: up 0.70%, now 0.20% off the peak
     }
     if (sell) {
       orders.push({ side: 'sell', symbol: SYMBOL, qty: pos!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      tranche = 0;
-      coolSellClose = close;
+      peak = 0n;
     }
     return orders;
   },
